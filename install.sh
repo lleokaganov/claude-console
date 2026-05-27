@@ -172,10 +172,6 @@ WSCHAT_NICK="$NICK" WSCHAT_X_SEED="$WSCHAT_X_SEED" WSCHAT_ED_SEED="$WSCHAT_ED_SE
   WSCHAT_PEER_QR="$PEER_QR" WSCHAT_WATCH="$SAY" \
   "$WSCHAT_BIN" >> "$LOG" 2>&1 &
 WSCHAT_PID=$!
-trap 'kill "$WSCHAT_PID" 2>/dev/null; wait 2>/dev/null' EXIT
-
-sleep 5
-echo "[run.sh ${NAME}] bridge pid=$WSCHAT_PID; entering responder loop" >&2
 
 # Line-by-line responder. wschat formats incoming as "<peer.nick>: <text>";
 # anything else is status / receipts / blank. The peer's nick is what they
@@ -183,19 +179,41 @@ echo "[run.sh ${NAME}] bridge pid=$WSCHAT_PID; entering responder loop" >&2
 # introduce themselves — so we don't try to match a specific nick.
 # A peer named "[wschat]" or "  ✓" would be eaten, which is silly enough
 # to be acceptable for v1.
-exec tail -n 0 -F "$LOG" 2>/dev/null | while IFS= read -r line; do
-  case "$line" in
-    '['*)         continue ;;   # "[wschat] ..." status
-    '  ✓'*)       continue ;;   # delivery / read receipts of OUR outgoing
-    ''|' '*)      continue ;;   # blank / leading-space cruft
-    *': '*)
-      msg="${line#*: }"
-      [ -z "$msg" ] && continue
-      reply=$(claude -p --continue --dangerously-skip-permissions "$msg" 2>/dev/null)
-      [ -n "$reply" ] && printf '%s\n' "$reply" >> "$SAY"
-      ;;
-  esac
-done
+#
+# Background subshell (not exec'd into PID 1) so this script can supervise
+# BOTH children. See `wait -n` below for why.
+(
+  tail -n 0 -F "$LOG" 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      '['*)         continue ;;   # "[wschat] ..." status
+      '  ✓'*)       continue ;;   # delivery / read receipts of OUR outgoing
+      ''|' '*)      continue ;;   # blank / leading-space cruft
+      *': '*)
+        msg="${line#*: }"
+        [ -z "$msg" ] && continue
+        reply=$(claude -p --continue --dangerously-skip-permissions "$msg" 2>/dev/null)
+        [ -n "$reply" ] && printf '%s\n' "$reply" >> "$SAY"
+        ;;
+    esac
+  done
+) &
+RESPONDER_PID=$!
+
+trap 'kill "$WSCHAT_PID" "$RESPONDER_PID" 2>/dev/null; wait 2>/dev/null' EXIT TERM INT
+
+sleep 5
+echo "[run.sh ${NAME}] bridge pid=$WSCHAT_PID, responder pid=$RESPONDER_PID — supervising" >&2
+
+# Why wait -n: an earlier version exec'd `tail | while` and ran wschat in
+# the background. When wschat died silently, the tail-pipe kept running,
+# the script stayed alive, and systemd Restart=always never fired — the
+# unit looked healthy but the bridge was dead. Now: whichever child exits
+# first triggers this script to exit non-zero → systemd restarts the unit
+# → wschat is revived. Needs bash 4.3+ (Debian trixie has 5.x).
+wait -n "$WSCHAT_PID" "$RESPONDER_PID"
+DEAD_CODE=$?
+echo "[run.sh ${NAME}] child exited (code=$DEAD_CODE) — exiting so systemd restarts the unit" >&2
+exit 1
 RUN_BODY_EOF
 chmod +x "$DIR/run.sh"
 
