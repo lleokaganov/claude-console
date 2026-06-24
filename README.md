@@ -106,25 +106,65 @@ tail -F /home/claude/Alice/.bridge/log
 
 Environment overrides (set when running `install.sh`):
 
-| Var            | Default                       | Meaning                  |
-|----------------|-------------------------------|--------------------------|
-| `CONSOLE_HOME` | `/home/claude`                | parent dir for consoles  |
-| `WSCHAT_BIN`   | `$CONSOLE_HOME/wschat`        | wschat binary path       |
-| `SERVICE_USER` | current user                  | systemd `User=`          |
+| Var                | Default                            | Meaning                                                    |
+|--------------------|------------------------------------|------------------------------------------------------------|
+| `CONSOLE_HOME`     | `/home/claude`                     | parent dir for consoles                                    |
+| `WSCHAT_BIN`       | `$CONSOLE_HOME/wschat`             | wschat binary path                                         |
+| `SERVICE_USER`     | current user                       | systemd `User=`                                            |
+| `CLAUDE_TOKEN_ENV` | `$CONSOLE_HOME/.claude-token.env`  | file exporting `CLAUDE_CODE_OAUTH_TOKEN` (long-lived auth) |
+| `MAILBOX_X_PUB`    | _empty (off)_                      | hex X25519 pub of a `ws_mailbox` sidecar for offline cache |
+| `MAILBOX_ED_PUB`   | _empty (off)_                      | hex Ed25519 pub of that mailbox                            |
+
+### Long-lived auth token
+
+The default `claude login` OAuth token expires every ~24h, and a
+long-running claude process inside the console won't refresh it on its
+own — without an explicit long-lived token your console will silently
+start replying `Not logged in · Please run /login` after a day.
+
+To set up:
+
+```sh
+claude setup-token
+# Copy the printed sk-ant-oat01-… token, then:
+echo 'export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...' > /home/claude/.claude-token.env
+chmod 600 /home/claude/.claude-token.env
+```
+
+The token is valid for one year. `run.sh` sources this file before
+starting `claude`, so the env var is in scope of the persistent process.
+
+### ws_mailbox offline cache (optional)
+
+If you also run [`ws_mailbox`](https://github.com/lleokaganov/ws_mailbox)
+next to your `ws_server` instance, pass its public keys to
+`install.sh` via `MAILBOX_X_PUB` and `MAILBOX_ED_PUB`. The console's
+wschat will then transparently store outgoing messages in the mailbox
+when the peer is offline, and pull pending messages from it on
+reconnect — so chat survives both ends going offline at different
+times.
 
 ## Files in each console directory
 
 ```
 <CONSOLE_HOME>/<NAME>/
 ├── CLAUDE.md                          # persona / context (edit to taste)
-├── run.sh                             # generated; bridge + responder
+├── run.sh                             # generated; supervisor for 4 children
 └── .bridge/
-    ├── seeds.env                      # fixed crypto seeds  (chmod 600)
+    ├── seeds.env                      # fixed crypto seeds      (chmod 600)
     ├── peer_qr                        # the peer's invite QR
     ├── peer_qr.source.txt             # the original URL it came from
+    ├── session.uuid                   # pinned claude session ID (chmod 600)
+    ├── session.bootstrapped           # marker: session created at least once
     ├── log                            # wschat output (truncated on restart)
-    └── say                            # watch-file: append text to send
+    ├── say                            # watch-file: append text to send
+    ├── claude.in                      # stream-json user messages → claude
+    ├── claude.out                     # stream-json events from claude
+    └── claude.err                     # claude stderr (errors only)
 ```
+
+And one shared (across all consoles) file at `$CONSOLE_HOME/.claude-token.env`
+holding the long-lived OAuth token export.
 
 ## Security notes
 
@@ -147,14 +187,23 @@ Environment overrides (set when running `install.sh`):
 
 ## Caveats
 
-- v1 responder is line-based. Multi-line messages from the peer carry the
-  nick prefix only on the first line (a wschat artefact) — long-form
-  prose may be truncated. To be improved.
-- Each incoming message spawns a new `claude -p --continue` process,
-  which loads context fresh from `CLAUDE.md` every time. Responses are
-  noticeably slower than an interactive Claude session.
-- No rate limiting. A peer who pastes a wall of text triggers a wall of
-  `claude -p` invocations.
+- The responder reads wschat's log line-by-line. Multi-line messages
+  from the peer carry the nick prefix only on the first line (a wschat
+  artefact) — continuation lines are picked up by the same case-arm and
+  joined into the user message. Edge cases (peer nicknamed `[wschat]`
+  or `  ✓…`) would be eaten as status lines.
+- `claude` runs as one persistent process; its conversation is
+  rebuilt on restart by `--resume <session UUID>`. If the session
+  itself becomes corrupted or you want a fresh start, delete
+  `.bridge/session.uuid` and `.bridge/session.bootstrapped`, then
+  restart the unit — a new session UUID is generated and the
+  conversation starts from scratch (memory files survive).
+- The context window will eventually fill. `claude` auto-compacts
+  long sessions into summaries near the limit — the peer sees no
+  break in conversation, but precise wording of very old turns is
+  replaced by summaries.
+- No rate limiting. A peer who pastes a wall of text immediately fills
+  `claude.in` with that many user-turn events.
 
 ## License
 
