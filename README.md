@@ -16,18 +16,28 @@ you've explicitly given the keys to).
 ## How it works
 
 ```
-   ┌────────────┐    e2e-encrypted    ┌──────────────────┐
-   │ chat app   │ ◄─── wschat ──── ► │ wschat bridge    │
-   │ on phone   │      bridge         │   (this repo)    │
-   └────────────┘                     │                  │
-                                       │   ↓ message      │
-                                       │ claude -p        │
-                                       │   --continue     │
-                                       │   ↓ reply        │
-                                       │ writes to bridge │
-                                       └──────────────────┘
+   ┌────────────┐    e2e-encrypted    ┌────────────────────────────┐
+   │ chat app   │ ◄─── wschat ─────► │ wschat bridge              │
+   │ on phone   │      bridge         │ (this repo)                │
+   └────────────┘                     │   ↓ message                │
+                                       │ responder → stream-json    │
+                                       │   ↓                        │
+                                       │ claude -p (long-running,   │
+                                       │   stream-json IO, pinned   │
+                                       │   session UUID, --resume)  │
+                                       │   ↓ JSON events            │
+                                       │ jq parser → assistant text │
+                                       │   ↓                        │
+                                       │ writes to bridge → peer    │
+                                       └────────────────────────────┘
                                        systemd Restart=always
+                                       (4 supervised children)
 ```
+
+`claude` is **one persistent process per console** — not a fresh
+invocation per message. The conversation stays in memory, context is
+not reloaded on every turn, and the pinned session UUID lets the
+process resume the same chat across restarts and reboots.
 
 The peer's chat app must speak the wschat protocol — see the [`telefon`
 chat app](https://github.com/lleokaganov/tele) and its
@@ -39,8 +49,11 @@ chat app](https://github.com/lleokaganov/tele) and its
 - Linux with systemd, `sudo` (passwordless for the install user) and
   `openssl`.
 - [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/quickstart)
-  installed and logged in (`claude login`) for the user that will run the
-  console.
+  installed and authenticated. Strongly recommended: a long-lived OAuth
+  token via `claude setup-token` written to an env file — see
+  `CLAUDE_TOKEN_ENV` below. Plain `claude login` works too but its OAuth
+  expires every ~24h and a long-running claude process won't refresh it.
+- `jq` for parsing stream-json events (`sudo apt install jq`).
 - A wschat binary on disk. Default path: `/home/claude/wschat`. Override
   with `WSCHAT_BIN=/path/to/wschat` when running `install.sh`.
 - A peer running a wschat-compatible chat app, who has shared their public

@@ -2,7 +2,8 @@
 # claude-console installer — set up a Claude Code "console" reachable from a
 # phone over an end-to-end encrypted chat bridge.
 #
-# A console = (wschat bridge) + (claude -p responder loop) + (systemd unit).
+# A console = (wschat bridge) + (long-running `claude -p` brain) + (jq parser)
+# + (responder) + (systemd unit that supervises all four).
 # One console per peer (e.g. yourself, or a family member you trust). Each
 # has a fixed cryptographic identity so the peer's contact stays stable.
 #
@@ -13,28 +14,41 @@
 #   curl -fsS <url>/install.sh | bash -s <NAME>
 #
 # Env overrides:
-#   CONSOLE_HOME   parent dir for consoles. Default: /home/claude
-#   WSCHAT_BIN     wschat binary to use.    Default: $CONSOLE_HOME/wschat
-#   SERVICE_USER   systemd User=.           Default: current user
+#   CONSOLE_HOME       parent dir for consoles.   Default: /home/claude
+#   WSCHAT_BIN         wschat binary to use.      Default: $CONSOLE_HOME/wschat
+#   SERVICE_USER       systemd User=.             Default: current user
+#   CLAUDE_TOKEN_ENV   file exporting a long-lived CLAUDE_CODE_OAUTH_TOKEN
+#                      (see `claude setup-token`).
+#                                                 Default: $CONSOLE_HOME/.claude-token.env
+#   MAILBOX_X_PUB      hex X25519 pub of a ws_mailbox sidecar.
+#                                                 Default: empty (mailbox off)
+#   MAILBOX_ED_PUB     hex Ed25519 pub of that mailbox.
+#                                                 Default: empty (mailbox off)
 #
 # Bootstrap (only the missing pieces are written; existing files untouched):
-#   key.txt            → .bridge/peer_qr  (accepts a peer-invite URL with a
-#                                          "?peer=K0…" query, or a raw "K0…"
-#                                          QR string)
-#   .bridge/seeds.env  → fresh random 32-byte X + ED seeds (FIXED forever
-#                        after generation — gives the peer a stable contact)
-#   CLAUDE.md          → generic English template (edit to personalise)
+#   key.txt              → .bridge/peer_qr  (accepts a peer-invite URL with a
+#                                            "?peer=K0…" query, or a raw "K0…"
+#                                            QR string)
+#   .bridge/seeds.env    → fresh random 32-byte X + ED seeds (FIXED forever
+#                          — gives the peer a stable contact)
+#   .bridge/session.uuid → persistent claude session ID, pinned at install-time
+#                          so `claude --resume <UUID>` always continues the
+#                          same conversation across restarts and reboots.
+#   CLAUDE.md            → generic English template (edit to personalise)
 #
 # Then writes $CONSOLE_HOME/<NAME>/run.sh and the systemd unit
 # /etc/systemd/system/claude-<NAME>.service, daemon-reloads, enables, and
 # restarts. Idempotent: re-runs refresh run.sh + the unit without touching
-# the identity / peer_qr / CLAUDE.md.
+# the identity / peer_qr / session.uuid / CLAUDE.md.
 
 set -euo pipefail
 
 CONSOLE_HOME="${CONSOLE_HOME:-/home/claude}"
 WSCHAT_BIN="${WSCHAT_BIN:-$CONSOLE_HOME/wschat}"
 SERVICE_USER="${SERVICE_USER:-$USER}"
+CLAUDE_TOKEN_ENV="${CLAUDE_TOKEN_ENV:-$CONSOLE_HOME/.claude-token.env}"
+MAILBOX_X_PUB="${MAILBOX_X_PUB:-}"
+MAILBOX_ED_PUB="${MAILBOX_ED_PUB:-}"
 
 # --- NAME resolution: arg → env → basename of cwd ---
 NAME="${1:-${NAME:-}}"
@@ -90,6 +104,15 @@ EOF
   chmod 600 "$DIR/.bridge/seeds.env"
 fi
 
+# --- .bridge/session.uuid: persistent claude session ID, one-shot ---
+# Stable across restarts so `claude --resume <UUID>` always continues the same
+# conversation. Rotate this = fresh memory loss; preserve it.
+if [ ! -s "$DIR/.bridge/session.uuid" ]; then
+  echo "$TAG generating persistent claude session UUID (one-shot)"
+  cat /proc/sys/kernel/random/uuid > "$DIR/.bridge/session.uuid"
+  chmod 600 "$DIR/.bridge/session.uuid"
+fi
+
 # --- CLAUDE.md: write a generic template if absent (edit to taste) ---
 if [ ! -f "$DIR/CLAUDE.md" ]; then
   echo "$TAG writing generic CLAUDE.md template (edit $DIR/CLAUDE.md to personalise)"
@@ -119,8 +142,10 @@ your own directory, helping with text or code) needs no ceremony.
 
 ## The bridge
 A wrapper (\`run.sh\`) manages the wschat bridge and feeds incoming
-messages to you as prompts. Reconnects, queueing and per-restart log
-rotation are not your concern. Your reply is whatever you print on stdout.
+messages to you through a long-running \`claude -p\` process using
+stream-json IO. Your conversation is one continuous session pinned by
+a stable UUID — context survives restarts. Reconnects, queueing,
+auto-compaction and per-restart log rotation are not your concern.
 
 ## Privacy
 You have your own session and memory. You do not see other Claude
@@ -132,20 +157,24 @@ fi
 # --- prerequisites ---
 [ -x "$WSCHAT_BIN" ] || { echo "$TAG missing wschat binary at $WSCHAT_BIN (override with WSCHAT_BIN=…)" >&2; exit 1; }
 command -v claude >/dev/null || { echo "$TAG 'claude' CLI not in PATH" >&2; exit 1; }
+command -v jq >/dev/null     || { echo "$TAG 'jq' not in PATH (install: sudo apt install jq)" >&2; exit 1; }
 
 # --- launcher: write run.sh in two parts ---
-# Part 1 (UNQUOTED): bake NAME and WSCHAT_BIN into run.sh's own scope.
+# Part 1 (UNQUOTED): bake config into run.sh's own scope.
 echo "$TAG writing $DIR/run.sh"
 cat > "$DIR/run.sh" <<RUN_HEAD_EOF
 #!/bin/bash
-# Eternal Claude console — wschat bridge + claude -p responder.
+# Eternal Claude console — wschat bridge + long-running claude + jq parser.
 # Generated by install.sh — values baked at install-time.
 NAME='${NAME}'
 WSCHAT_BIN='${WSCHAT_BIN}'
+CLAUDE_TOKEN_ENV='${CLAUDE_TOKEN_ENV}'
+MAILBOX_X_PUB='${MAILBOX_X_PUB}'
+MAILBOX_ED_PUB='${MAILBOX_ED_PUB}'
 RUN_HEAD_EOF
 
 # Part 2 (QUOTED): body. All \${...} refs are literal, resolved by run.sh
-# at runtime where NAME and WSCHAT_BIN are already set above.
+# at runtime where the values above are already set.
 cat >> "$DIR/run.sh" <<'RUN_BODY_EOF'
 set -u
 cd "$(dirname "$(readlink -f "$0")")"
@@ -154,34 +183,90 @@ SAY=.bridge/say
 LOG=.bridge/log
 QR_FILE=.bridge/peer_qr
 SEEDS=.bridge/seeds.env
+CLAUDE_IN=.bridge/claude.in
+CLAUDE_OUT=.bridge/claude.out
+CLAUDE_ERR=.bridge/claude.err
 
 [ -f "$SEEDS" ]   || { echo "missing $SEEDS"   >&2; exit 1; }
 [ -f "$QR_FILE" ] || { echo "missing $QR_FILE" >&2; exit 1; }
 
 . "$SEEDS"
 PEER_QR=$(cat "$QR_FILE")
-# Nick: "Claude · <NAME>␟claude" — U+241F is a type-tag separator the
-# peer's app may use to label the contact as 'type=claude' (optional;
-# apps that don't parse it just see the full string as the nick).
+SESSION_UUID=$(cat .bridge/session.uuid)
 NICK=$'Claude · '"${NAME}"$'\xe2\x90\x9fclaude'
 
 touch "$SAY"
-: > "$LOG"   # fresh log per restart — wschat re-introduces on (re)connect.
+: > "$LOG"          # fresh log per restart — wschat re-introduces on connect.
 
-WSCHAT_NICK="$NICK" WSCHAT_X_SEED="$WSCHAT_X_SEED" WSCHAT_ED_SEED="$WSCHAT_ED_SEED" \
+# Reset claude.* IO files. `rm -f` first because an older install version
+# created claude.in as a FIFO; `: > $fifo` would block forever waiting for
+# a reader. Always recreate as a regular file.
+rm -f "$CLAUDE_IN" "$CLAUDE_OUT" "$CLAUDE_ERR"
+: > "$CLAUDE_IN"
+: > "$CLAUDE_OUT"
+: > "$CLAUDE_ERR"
+
+# ============================== wschat bridge ==============================
+# Optional: mailbox env vars are forwarded to wschat. If your wschat build
+# supports ws_mailbox offline-cache, it will use them; otherwise harmless.
+WSCHAT_NICK="$NICK" \
+  WSCHAT_X_SEED="$WSCHAT_X_SEED" WSCHAT_ED_SEED="$WSCHAT_ED_SEED" \
   WSCHAT_PEER_QR="$PEER_QR" WSCHAT_WATCH="$SAY" \
+  WSCHAT_MAILBOX_X_PUB="$MAILBOX_X_PUB" \
+  WSCHAT_MAILBOX_ED_PUB="$MAILBOX_ED_PUB" \
   "$WSCHAT_BIN" >> "$LOG" 2>&1 &
 WSCHAT_PID=$!
 
-# Line-by-line responder. wschat formats incoming as "<peer.nick>: <text>";
-# anything else is status / receipts / blank. The peer's nick is what they
-# chose in their app, not our local NAME, and may be empty until they
-# introduce themselves — so we don't try to match a specific nick.
-# A peer named "[wschat]" or "  ✓" would be eaten, which is silly enough
-# to be acceptable for v1.
-#
-# Background subshell (not exec'd into PID 1) so this script can supervise
-# BOTH children. See `wait -n` below for why.
+# ============================== claude brain ==============================
+# ONE long-running `claude -p` per console — NOT a fresh process per message.
+# Spawning fresh claude on every line lost in-memory state and triggered an
+# auth refresh on every spawn (which broke when run on a long-lived token).
+# The persistent process keeps the full conversation alive in memory and
+# just streams more turns into it via stream-json.
+if [ -f "$CLAUDE_TOKEN_ENV" ]; then
+  . "$CLAUDE_TOKEN_ENV"
+fi
+
+if [ -f .bridge/session.bootstrapped ]; then
+  SESSION_FLAG=(--resume "$SESSION_UUID")
+else
+  SESSION_FLAG=(--session-id "$SESSION_UUID")
+fi
+
+(
+  tail -n 0 -F "$CLAUDE_IN" 2>/dev/null | claude -p \
+    --input-format stream-json --output-format stream-json \
+    --verbose --dangerously-skip-permissions \
+    "${SESSION_FLAG[@]}" \
+    >> "$CLAUDE_OUT" 2>> "$CLAUDE_ERR"
+) &
+CLAUDE_PID=$!
+
+sleep 2
+[ -f .bridge/session.bootstrapped ] || touch .bridge/session.bootstrapped
+
+# ============================== parser ==============================
+# Tail claude's stream-json output, pluck out assistant text events, write
+# the joined text to SAY (which wschat watches and ships to the peer).
+(
+  tail -n 0 -F "$CLAUDE_OUT" 2>/dev/null | while IFS= read -r evt; do
+    [ -z "$evt" ] && continue
+    txt=$(printf '%s' "$evt" | jq -r '
+      select(.type == "assistant")
+      | (.message.content // [])
+      | map(select(.type == "text") | .text)
+      | join("\n")
+      | select(. != "")
+    ' 2>/dev/null)
+    [ -n "$txt" ] && printf '%s\n' "$txt" >> "$SAY"
+  done
+) &
+PARSER_PID=$!
+
+# ============================== responder ==============================
+# Wschat formats incoming as "<peer.nick>: <text>" (continuation lines too).
+# Anything that isn't a status / receipt / blank is wrapped as a stream-json
+# user message and appended to claude's input file.
 (
   tail -n 0 -F "$LOG" 2>/dev/null | while IFS= read -r line; do
     case "$line" in
@@ -191,26 +276,24 @@ WSCHAT_PID=$!
       *': '*)
         msg="${line#*: }"
         [ -z "$msg" ] && continue
-        reply=$(claude -p --continue --dangerously-skip-permissions "$msg" 2>/dev/null)
-        [ -n "$reply" ] && printf '%s\n' "$reply" >> "$SAY"
+        jq -nc --arg t "$msg" \
+          '{type:"user", message:{role:"user", content:$t}}' \
+          >> "$CLAUDE_IN"
         ;;
     esac
   done
 ) &
 RESPONDER_PID=$!
 
-trap 'kill "$WSCHAT_PID" "$RESPONDER_PID" 2>/dev/null; wait 2>/dev/null' EXIT TERM INT
+trap 'kill "$WSCHAT_PID" "$CLAUDE_PID" "$PARSER_PID" "$RESPONDER_PID" 2>/dev/null; wait 2>/dev/null' EXIT TERM INT
 
 sleep 5
-echo "[run.sh ${NAME}] bridge pid=$WSCHAT_PID, responder pid=$RESPONDER_PID — supervising" >&2
+echo "[run.sh ${NAME}] bridge=$WSCHAT_PID claude=$CLAUDE_PID parser=$PARSER_PID responder=$RESPONDER_PID — supervising" >&2
 
-# Why wait -n: an earlier version exec'd `tail | while` and ran wschat in
-# the background. When wschat died silently, the tail-pipe kept running,
-# the script stayed alive, and systemd Restart=always never fired — the
-# unit looked healthy but the bridge was dead. Now: whichever child exits
-# first triggers this script to exit non-zero → systemd restarts the unit
-# → wschat is revived. Needs bash 4.3+ (Debian trixie has 5.x).
-wait -n "$WSCHAT_PID" "$RESPONDER_PID"
+# Whichever child dies first triggers exit non-zero → systemd restarts the
+# unit → all four children are revived (and claude resumes the same session
+# via --resume + bootstrap marker). Needs bash 4.3+ (Debian trixie has 5.x).
+wait -n "$WSCHAT_PID" "$CLAUDE_PID" "$PARSER_PID" "$RESPONDER_PID"
 DEAD_CODE=$?
 echo "[run.sh ${NAME}] child exited (code=$DEAD_CODE) — exiting so systemd restarts the unit" >&2
 exit 1
@@ -221,7 +304,7 @@ chmod +x "$DIR/run.sh"
 echo "$TAG writing $UNIT_PATH (sudo)"
 sudo tee "$UNIT_PATH" > /dev/null <<UNIT_EOF
 [Unit]
-Description=Claude console for ${NAME} (wschat bridge + responder)
+Description=Claude console for ${NAME} (wschat bridge + persistent responder)
 After=network-online.target
 Wants=network-online.target
 
